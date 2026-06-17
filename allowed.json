@@ -1,0 +1,7 @@
+[
+  "for d in ~/ChiroHD/Alina-*; do\n  if [ -d \"$d\" ]; then\n    echo \"=== $(basename \"$d\") ===\"\n    ls -la \"$d\" | head -8\n    if [ -d \"$d/.git\" ]; then\n      echo \"branch: $(git -C \"$d\" branch --show-current)\"\n    fi\n  fi\ndone",
+  "for pr in 120 123 119 115 90; do\n  echo \"=== PR $pr ===\"\n  gh pr view $pr --repo ChiroHD/Alina --json title,reviewDecision,isDraft,mergeStateStatus,reviews,comments --jq '{title,reviewDecision,isDraft,mergeState:.mergeStateStatus,reviews:(.reviews|map({author:.author.login,state:.state})),commentCount:(.comments|length)}' 2>/dev/null\ndone",
+  "gh search prs --author=@me --state=open --json number,title,url,repository 2>&1",
+  "gh search prs --review-requested=@me --state=open --json number,title,url,repository 2>&1",
+  "python3 ~/.cursor/skills/daily-standup/scripts/calendar-today.py 2>&1"
+]
