@@ -278,6 +278,34 @@ export default function upstreamGuard(pi: ExtensionAPI) {
     },
   })
 
+  // ── list_permission_leases tool ───────────────────────────────────────────
+
+  pi.registerTool({
+    name: "list_permission_leases",
+    label: "List Permission Leases",
+    description: "List all active permission leases for this session, including group name, scope, and any bound capture variables.",
+    parameters: z.object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      if (!leaseSvc) {
+        return { content: [{ type: "text", text: "Permission services not initialized." }] }
+      }
+      const grants = leaseSvc.all()
+      if (grants.length === 0) {
+        return { content: [{ type: "text", text: "No active leases." }] }
+      }
+      const lines = grants.map(g => {
+        const bindings = Object.entries(g.bindings)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(", ")
+        return `  • ${g.group} [${g.scope}]${bindings ? ` (${bindings})` : ""}`
+      })
+      return {
+        content: [{ type: "text", text: `Active leases:\n${lines.join("\n")}` }],
+        details: { leases: grants },
+      }
+    },
+  })
+
   // ── tool_call interceptor ─────────────────────────────────────────────────
 
   pi.on("tool_call", async (event, ctx) => {
