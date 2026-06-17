@@ -209,6 +209,16 @@ export default function upstreamGuard(pi: ExtensionAPI) {
     }
   })
 
+  // ── /reload-guard slash command ───────────────────────────────────────────
+
+  pi.registerCommand("reload-guard", {
+    description: "Reload the upstream-guard extension (picks up changes to index.ts or permissions repo)",
+    handler: async (_args, ctx) => {
+      await ctx.reload()
+    },
+  })
+
+
   // ── request_permission_lease tool ─────────────────────────────────────────
 
   const z = pi.zod
