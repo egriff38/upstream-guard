@@ -1,0 +1,13 @@
+{
+  "name": "upstream-guard",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "OMP extension: intelligent permission negotiation for bash commands and MCP tool calls",
+  "dependencies": {
+    "effect": "beta"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

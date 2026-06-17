@@ -1,126 +1,47 @@
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { dirname } from "path";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
+import { Effect, Layer } from "effect"
+import { writeFileSync, readFileSync } from "fs"
+import type { MatchResult } from "./core/types.ts"
+import { PermissionsImportError } from "./core/config.ts"
+import { PermissionService, PermissionServiceLayer, splitShellSegments } from "./core/permission.ts"
+import type { PermissionServiceShape } from "./core/permission.ts"
+import { LeaseService, LeaseServiceLayer } from "./core/leases.ts"
+import type { LeaseServiceShape, Grant, ScopeTier } from "./core/leases.ts"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // upstream-guard
 //
-// Allow-list approach: commands matching ALLOW pass through silently.
-// Everything else gets a three-way dialog:
-//   • Allow once   — proceeds this time only
-//   • Always allow — persists the exact command to allowed.json
-//   • Deny         — blocks and tells the LLM why
+// Commands matching the group lattice (permissions repo) pass silently.
+// Unmatched commands get a four-way dialog:
+//   • Allow once              — proceeds this time only
+//   • Allow all <capture>=<v> — session-scoped lease binding (when captures exist)
+//   • Customize permissions   — opens negotiation pane via herdr
+//   • Deny                    — blocks and tells the LLM why
 //
-// Also intercepts MCP tools that make upstream writes to GitHub.
+// MCP upstream writes are intercepted separately.
+// Persistent allow-list (allowed.json) is read for backwards compat during
+// migration. New persistent grants are written to the permissions repo.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ALLOWED_FILE =
-  new URL("allowed.json", import.meta.url).pathname;
+// ── Legacy allowed.json (read-only during migration) ─────────────────────────
 
-// ── Built-in allow-list (regex patterns) ──────────────────────────────────────
-//
-// Patterns are prefix-anchored (^) where appropriate.
-// Any command matching one of these passes without a prompt.
-const ALLOW: ReadonlyArray<RegExp> = [
-  // ── Shell navigation / inspection ─────────────────────────────────────────
-  /^(ls|ll|la|l)\b/,
-  /^(cat|less|more|head|tail|wc|tee)\b/,
-  /^(echo|printf|pwd|cd|pushd|popd|which|type|where|man|help)\b/,
-  /^(clear|reset|exit|fg|bg|jobs)\b/,
-  /^(date|cal|uptime|uname|hostname|id|whoami)\b/,
-  /^(open\s|code\b|cursor\b)/,
-  /^(jq|awk|sed|grep|rg|fd|find|sort|uniq|cut|tr|xargs|comm|diff|wc)\b/,
-  /^(sqlite3|python3?\s+-[cm]|node\s+-e)\b/,
-  /^(afplay|pbpaste|pbcopy)\b/,
-  /^(kill|lsof|ps)\b/,
-  /^(mkdir|touch|mktemp)\b/,
-  // cp is safe unless targeting system paths
-  /^cp\b(?!.*\s\/etc\/|\s~\/\.aws\/)/,
+const ALLOWED_FILE = new URL("allowed.json", import.meta.url).pathname
+const legacyAllowed = new Set<string>()
 
-  // ── Git: read-only ─────────────────────────────────────────────────────────
-  /^git\s+(status|diff|log|show|branch|remote|tag|describe|shortlog|blame|fetch)\b/,
-  /^git\s+(stash\s+(list|show)|worktree\s+list|ls-tree|ls-files|rev-parse)\b/,
-  /^(gs|gd|glgga|glo|glog|gst)\b/,
+function loadLegacyAllowed(): void {
+  try {
+    const entries: unknown = JSON.parse(readFileSync(ALLOWED_FILE, "utf8"))
+    if (Array.isArray(entries)) {
+      legacyAllowed.clear()
+      for (const e of entries) {
+        if (typeof e === "string") legacyAllowed.add(e)
+      }
+    }
+  } catch { /* file doesn't exist yet */ }
+}
 
-  // ── Git: safe local mutations (no upstream) ────────────────────────────────
-  /^git\s+(add|commit|stash|checkout|switch|restore|merge|rebase|cherry-pick)\b/,
-  /^git\s+reset\b(?!.*--hard)/,                          // soft/mixed only
-  /^git\s+worktree\s+(add|prune|remove)\b(?!.*--force)/, // remove --force requires confirm
-  /^git\s+(pull|fetch)\b/,
-  /^git-crypt\s+(status|unlock|lock)\b/,
-  /^(ga\b|gc\b|gco\b|gcm\b|gcd\b|gf\b|gl\b|gb\b)/,
+// ── MCP upstream writes ───────────────────────────────────────────────────────
 
-  // ── pnpm: local-only operations ────────────────────────────────────────────
-  /^pnpm\s+(install|i)\b/,
-  /^pnpm\s+(build|typecheck|lint|test|dev|e2e|knip|taze)\b/,
-  /^pnpm\s+(-w|--workspace-root)\s+(turbo:|typecheck|lint|test|build|e2e)\b/,
-  /^pnpm\s+(-r|--recursive)\s+(build|typecheck|lint)\b/,
-  /^pnpm\s+(--filter|-F)\s+\S+\s+(dev|build|typecheck|lint|test|e2e)\b/,
-  /^pnpm\s+(--filter|-F)\s+\S+\s+(backfill|diagnose|listTranscripts|printEnv|print-env|diagnose-office|update-sked-client|passphrase)\b/,
-  /^pnpm\s+(--filter|-F)\s+\S+\s+add-number\b/,
-  /^pnpm\s+exec\s+(tsc|cdk\s+synth|cdk\s+ls|turbo)\b/,
-  /^pnpm\s+(turbo:|ls|list|audit|why|outdated|approve-builds)\b/,
-  /^pnpm\s+(print-env|printEnv)\b/,
-  /^pnpm\s+link-plugins\b/,
-  /^pnpm\s+(-w\s+)?e2e\b/,
-  /pnpm.*--dry-run/,
-
-  // ── AWS: read-only ─────────────────────────────────────────────────────────
-  /^aws\s+s3\s+ls\b/,
-  /^aws\s+(cloudformation|cfn)\s+(describe|list|get|validate)\b/,
-  /^aws\s+logs\s+(tail|filter-log-events|describe|get)\b/,
-  /^aws\s+ssm\s+(get|list|describe)\b/,
-  /^aws\s+lambda\s+(list|get)\b/,
-  /^aws\s+sts\s+get-caller-identity\b/,
-  /^aws\s+sso\s+login\b/,
-  /^aws\s+stepfunctions\s+(list|describe|get)\b/,
-  /^aws\s+secretsmanager\s+(list|describe|get)\b/,
-
-  // ── curl: GET-only ─────────────────────────────────────────────────────────
-  /^curl\b(?![\s\S]*-X\s*(POST|PUT|PATCH|DELETE))/i,
-
-  // ── Node / build tools ─────────────────────────────────────────────────────
-  /^(node|tsx|tsc|npx\s+tsc|npx\s+knip|npx\s+taze|npx\s+skills\s+(find|list|search))\b/,
-  /^bun\s+run\b/,
-  /^bun\s+upgrade\b/,
-
-  // ── Package managers: read-only ────────────────────────────────────────────
-  /^brew\s+(info|search|list|doctor|outdated|deps)\b/,
-  /^npm\s+(list|ls|outdated|audit|info|view|run\s+(build|test|lint))\b/,
-
-  // ── GitHub CLI: read-only ──────────────────────────────────────────────────
-  /^gh\s+pr\s+(list|view|status|diff|checkout)\b/,
-  /^gh\s+repo\s+(list|view|clone)\b/,
-  /^gh\s+run\s+(list|view)\b/,
-  /^gh\s+issue\s+(list|view)\b/,
-  /^gh\s+api\s+repos\b/,
-
-  // ── GitLab CLI: read-only ──────────────────────────────────────────────────
-  /^glab\s+(issue|mr|project|repo)\s+(list|view|get)\b/,
-
-  // ── Local env / secrets: read ──────────────────────────────────────────────
-  /^(loadAlinaEnv|source\s|exec\s+scripts\/load-env)\b/,
-  /^secretspec\s+check\b/,
-  /^op\s+read\b/,
-  /^ssh-add\s+-l\b/,
-
-  // ── Navigation utilities ───────────────────────────────────────────────────
-  /^(z\b|ghq\s+(list|look|ls)|branchyard)\b/,
-  /^(direnv\s+(allow|status|show))\b/,
-  /^(gwt|gws)\s+(list|ls|prune|status|-h)\b/,
-
-  // ── Misc safe ─────────────────────────────────────────────────────────────
-  /^(omp|claude|codex)\s*(-h|--help|list|resume|agents|-v|--version)\b/,
-  /^nix(-build)?\s+.*--dry-run\b/,
-  /^nix\s+(develop|--help|--version)\b/,
-  /^(cabal|ghci|ghc)\b/,
-  /^export\s+\w+=/,
-  /^unset\s+\w+/,
-  /^(source|\.)\s+/,
-  /^STACK_ID=/,
-];
-
-// MCP tools that write to remote systems — always prompt regardless
 const UPSTREAM_MCP_TOOLS: ReadonlySet<string> = new Set([
   "mcp__github_push_files",
   "mcp__github_create_or_update_file",
@@ -131,222 +52,316 @@ const UPSTREAM_MCP_TOOLS: ReadonlySet<string> = new Set([
   "mcp__github_update_pull_request",
   "mcp__github_create_repository",
   "mcp__github_fork_repository",
-]);
+])
 
-// ── Persistent allow-list ─────────────────────────────────────────────────────
-//
-// Stores exact command strings the user has chosen to "Always allow".
-// File: ~/.omp/agent/extensions/upstream-guard/allowed.json
-//
-// Commands are matched by exact equality against the trimmed input.
-// To allow a class of commands, edit the file and add a line manually —
-// the extension re-reads the file at each session start.
+// ── Dialog option labels ──────────────────────────────────────────────────────
 
-const persistentAllowed = new Set<string>();
-
-function loadPersistentAllowed(): void {
-  try {
-    const raw = readFileSync(ALLOWED_FILE, "utf8");
-    const entries: unknown = JSON.parse(raw);
-    if (Array.isArray(entries)) {
-      persistentAllowed.clear();
-      for (const e of entries) {
-        if (typeof e === "string") persistentAllowed.add(e);
-      }
-    }
-  } catch {
-    // File doesn't exist yet — that's fine.
-  }
-}
-
-function savePersistentAllowed(): void {
-  mkdirSync(dirname(ALLOWED_FILE), { recursive: true });
-  writeFileSync(
-    ALLOWED_FILE,
-    JSON.stringify([...persistentAllowed].sort(), null, 2) + "\n",
-    "utf8",
-  );
-}
-
-// ── Core check ────────────────────────────────────────────────────────────────
-
-function isAllowed(cmd: string): boolean {
-  const trimmed = cmd.trimStart();
-  return (
-    persistentAllowed.has(trimmed) || ALLOW.some((p) => p.test(trimmed))
-  );
-}
-
-// ── Compound-command splitter ─────────────────────────────────────────────────
-//
-// Splits a shell command on &&, ||, and ; without breaking on those characters
-// that appear inside single- or double-quoted strings.
-//
-// The approach: walk character-by-character tracking quote state; whenever we
-// hit an unquoted operator token, flush the current segment.  We do NOT handle
-// backtick sub-shells or $(...) — those are rare and the guard should prompt
-// on them anyway because the inner command won't be on the allow-list.
-
-function splitShellSegments(cmd: string): string[] {
-  const segments: string[] = [];
-  let current = "";
-  let inSingle = false;
-  let inDouble = false;
-  let i = 0;
-
-  const flush = () => {
-    const s = current.trim();
-    if (s) segments.push(s);
-    current = "";
-  };
-
-  while (i < cmd.length) {
-    const ch = cmd[i];
-
-    if (inSingle) {
-      if (ch === "'") inSingle = false;
-      current += ch;
-      i++;
-      continue;
-    }
-
-    if (inDouble) {
-      // Inside double-quotes a backslash can escape the next char.
-      if (ch === "\\" && i + 1 < cmd.length) {
-        current += ch + cmd[i + 1];
-        i += 2;
-        continue;
-      }
-      if (ch === '"') inDouble = false;
-      current += ch;
-      i++;
-      continue;
-    }
-
-    // Unquoted — check for quote openers first.
-    if (ch === "'") { inSingle = true; current += ch; i++; continue; }
-    if (ch === '"') { inDouble = true; current += ch; i++; continue; }
-
-    // Check for &&, ||, or ;
-    if ((ch === "&" || ch === "|") && cmd[i + 1] === ch) {
-      flush();
-      i += 2;
-      continue;
-    }
-    if (ch === ";") {
-      flush();
-      i++;
-      continue;
-    }
-
-    current += ch;
-    i++;
-  }
-
-  flush();
-  return segments.length > 0 ? segments : [cmd.trim()];
-}
+const OPT_ONCE       = "Allow once"
+const OPT_CUSTOMIZE  = "Customize permissions"
+const OPT_DENY       = "Deny"
 
 // ── Permission dialog ─────────────────────────────────────────────────────────
 
-const OPT_ONCE   = "Allow once";
-const OPT_ALWAYS = "Always allow";
-const OPT_DENY   = "Deny";
+type Decision =
+  | { tag: "once" }
+  | { tag: "grant"; scope: ScopeTier; bindings: Readonly<Record<string, string>> }
+  | { tag: "customize" }
+  | { tag: "deny" }
 
 async function requestPermission(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
   title: string,
   cmd: string,
-): Promise<"once" | "always" | "deny"> {
-  if (!ctx.hasUI) return "deny";
+  match: MatchResult | null,
+): Promise<Decision> {
+  if (!ctx.hasUI) return { tag: "deny" }
 
-  const display = cmd.length > 300 ? cmd.slice(0, 300) + "…" : cmd;
+  const display = cmd.length > 300 ? cmd.slice(0, 300) + "…" : cmd
 
-  pi.events.emit("herdr:blocked", { active: true, label: "Waiting for confirmation…" });
-  ctx.ui.setWorkingMessage("Waiting for confirmation…");
-  let choice: string | undefined;
+  // Build lease options from named captures with the `allowed*` convention.
+  const leaseCaptures = match
+    ? Object.entries(match.captures).filter(([k]) => k.startsWith("allowed"))
+    : []
+  const leaseLabel = leaseCaptures.length > 0
+    ? `Allow all (${leaseCaptures.map(([k, v]) => `${k}=${v}`).join(", ")})`
+    : null
+
+  const opts = [
+    OPT_ONCE,
+    ...(leaseLabel ? [leaseLabel] : []),
+    OPT_CUSTOMIZE,
+    OPT_DENY,
+  ]
+
+  pi.events.emit("herdr:blocked", { active: true, label: "Waiting for confirmation…" })
+  ctx.ui.setWorkingMessage("Waiting for confirmation…")
+  let choice: string | undefined
   try {
-    choice = await ctx.ui.select(
-      `${title}: ${display}`,
-      [OPT_ONCE, OPT_ALWAYS, OPT_DENY],
-    );
+    choice = await ctx.ui.select(`${title}: ${display}`, opts)
   } finally {
-    pi.events.emit("herdr:blocked", { active: false });
-    ctx.ui.setWorkingMessage(undefined);
+    pi.events.emit("herdr:blocked", { active: false })
+    ctx.ui.setWorkingMessage(undefined)
   }
 
-  if (choice === OPT_ALWAYS) return "always";
-  if (choice === OPT_ONCE)   return "once";
-  return "deny"; // undefined (dismissed) or OPT_DENY
+  if (choice === OPT_ONCE) return { tag: "once" }
+  if (choice === OPT_CUSTOMIZE) return { tag: "customize" }
+  if (leaseLabel && choice === leaseLabel) {
+    return {
+      tag: "grant",
+      scope: match?.group.defaultScope ?? "session",
+      bindings: Object.fromEntries(leaseCaptures),
+    }
+  }
+  return { tag: "deny" }
 }
+
+// ── Negotiation pane ──────────────────────────────────────────────────────────
+
+let negotiationPaneId: string | null = null
+
+async function openOrFocusNegotiationPane(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  blockedCmd: string,
+  leases: LeaseServiceShape,
+  permissions: PermissionServiceShape,
+): Promise<void> {
+  const handoff = {
+    blockedCommands: [blockedCmd],
+    cwd: ctx.cwd,
+    activeBindings: Object.fromEntries(leases.all().map(g => [g.group, g.bindings])),
+    builtinPatternCount: permissions.groups.length,
+    recentContext: [] as string[], // TODO: populate from ctx.sessionManager.getBranch()
+  }
+  const handoffPath = `/tmp/upstream-guard-handoff-${Date.now()}.json`
+  writeFileSync(handoffPath, JSON.stringify(handoff, null, 2))
+
+  if (negotiationPaneId) {
+    // Re-use existing pane: push the new command as a follow-up prompt.
+    await pi.exec("herdr", ["pane", "run", negotiationPaneId, `New blocked command: ${blockedCmd}`])
+    return
+  }
+
+  const paneJson = await pi.exec("herdr", [
+    "pane", "split", "$HERDR_PANE_ID", "--direction", "right", "--no-focus",
+  ])
+  const parsed = JSON.parse(paneJson.stdout ?? "{}")
+  const paneId: string = parsed?.result?.pane?.pane_id ?? ""
+  if (!paneId) {
+    ctx.ui.notify("Could not open negotiation pane — is herdr running?", "error")
+    return
+  }
+  negotiationPaneId = paneId
+
+  await pi.exec("herdr", ["pane", "run", paneId, `omp --handoff ${handoffPath}`])
+}
+
+// ── Runtime layer ─────────────────────────────────────────────────────────────
+
+const MainLayer = Layer.mergeAll(
+  PermissionServiceLayer,
+  LeaseServiceLayer,
+)
 
 // ── Extension entry point ─────────────────────────────────────────────────────
 
 export default function upstreamGuard(pi: ExtensionAPI) {
-  pi.setLabel("Upstream Guard");
+  pi.setLabel("Upstream Guard")
 
-  pi.on("session_start", async () => {
-    loadPersistentAllowed();
-  });
+  // Services are initialized once per session and reused across tool calls.
+  let permissionSvc: PermissionServiceShape | null = null
+  let leaseSvc: LeaseServiceShape | null = null
 
-  pi.on("tool_call", async (event, ctx) => {
-    // ── bash: allow-list gate ────────────────────────────────────────────────
-    if (event.toolName === "bash") {
-      const cmd = String(event.input.command ?? "").trim();
-      if (!cmd) return;
-      const segments = splitShellSegments(cmd);
-      if (segments.every(isAllowed)) return;
+  const getServices = () => Effect.runPromise(
+    Effect.gen(function* () {
+      const p = yield* PermissionService
+      const l = yield* LeaseService
+      return { p, l } as const
+    }).pipe(Effect.provide(MainLayer))
+  )
 
-      const decision = await requestPermission(ctx, pi, "Allow command?", cmd);
+  pi.on("session_start", async (_event, ctx) => {
+    loadLegacyAllowed()
 
-      if (decision === "always") {
-        persistentAllowed.add(cmd);
-        savePersistentAllowed();
-        ctx.ui.notify(`Added to allow-list: ${cmd.slice(0, 80)}`, "info");
-        return; // proceed
+    try {
+      const { p, l } = await getServices()
+      permissionSvc = p
+      leaseSvc = l
+
+      // Wire appendEntry for session-scoped grant persistence.
+      l.init((data: Grant) => {
+        pi.appendEntry("upstream-guard:grant", data)
+      })
+
+      // Replay session-scoped grants from log.
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type === "custom" && entry.customType === "upstream-guard:grant") {
+          const grant = entry.data as Grant
+          if (grant.scope === "session") l.restore(grant)
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof PermissionsImportError
+        ? `Failed to load permissions from ${err.path}. Falling back to built-in allow-list.`
+        : "upstream-guard: failed to initialize permission services."
+      ctx.ui.notify(msg, "error")
+    }
+  })
+
+  // ── request_permission_lease tool ─────────────────────────────────────────
+
+  const z = pi.zod
+
+  pi.registerTool({
+    name: "request_permission_lease",
+    label: "Request Permission Lease",
+    description:
+      "Declare the permission groups and bindings a skill or subagent needs before starting its task. " +
+      "The user is prompted once to approve, deny, or customize the full set.",
+    parameters: z.object({
+      leases: z.array(z.object({
+        group: z.string().describe("Group name, e.g. 'git:remoteAuthor'"),
+        scope: z.enum(["task", "session"]).default("task"),
+        bindings: z.record(z.string(), z.string()).default({}),
+      })).min(1),
+      reason: z.string().describe("Why this task needs these permissions"),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!leaseSvc || !permissionSvc) {
+        return {
+          content: [{ type: "text", text: "Permission services not initialized." }],
+          details: { granted: false },
+        }
       }
 
-      if (decision === "once") return; // proceed, don't persist
+      const display = params.leases
+        .map(l => `  • ${l.group}${Object.keys(l.bindings).length ? ` (${Object.entries(l.bindings).map(([k, v]) => `${k}=${v}`).join(", ")})` : ""}`)
+        .join("\n")
+
+      pi.events.emit("herdr:blocked", { active: true, label: "Lease request…" })
+      ctx.ui.setWorkingMessage("Waiting for lease approval…")
+      let choice: string | undefined
+      try {
+        choice = await ctx.ui.select(
+          `Grant permission lease?\n${params.reason}\n\n${display}`,
+          ["Grant", OPT_CUSTOMIZE, OPT_DENY],
+        )
+      } finally {
+        pi.events.emit("herdr:blocked", { active: false })
+        ctx.ui.setWorkingMessage(undefined)
+      }
+
+      if (choice === "Grant") {
+        for (const req of params.leases) {
+          const grp = permissionSvc.groups.find(g => g.name === req.group)
+          if (grp) leaseSvc.grant(grp, req.scope, req.bindings as Record<string, string>)
+        }
+        return {
+          content: [{ type: "text", text: `Granted ${params.leases.length} lease(s).` }],
+          details: { granted: true, leases: params.leases },
+        }
+      }
+
+      if (choice === OPT_CUSTOMIZE) {
+        await openOrFocusNegotiationPane(pi, ctx, `lease: ${params.reason}`, leaseSvc, permissionSvc)
+        return {
+          content: [{ type: "text", text: "Negotiation pane opened. Retry after permissions are updated." }],
+          details: { granted: false, customize: true },
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: "Permission lease denied." }],
+        details: { granted: false },
+      }
+    },
+  })
+
+  // ── tool_call interceptor ─────────────────────────────────────────────────
+
+  pi.on("tool_call", async (event, ctx) => {
+
+    // ── bash ────────────────────────────────────────────────────────────────
+    if (event.toolName === "bash") {
+      const cmd = String(event.input.command ?? "").trim()
+      if (!cmd) return
+
+      // Legacy exact-match fallback during migration.
+      if (legacyAllowed.has(cmd)) return
+
+      const segments = splitShellSegments(cmd)
+
+      if (!permissionSvc || !leaseSvc) {
+        // Services failed to load — fall back to built-in ALLOW check is gone;
+        // without services we must prompt rather than silently allow.
+        const decision = await requestPermission(ctx, pi, "Allow command?", cmd, null)
+        if (decision.tag !== "once") {
+          return { block: true, reason: "Permission services unavailable; command blocked." }
+        }
+        return
+      }
+
+      // Check every segment. If all match (with satisfied leases), pass.
+      const failing = segments.filter(seg => {
+        const match = permissionSvc!.check(seg)
+        if (!match) return true // no pattern → failing
+        // Pattern matched. Are there lease captures that need to be verified?
+        const leaseCaptures = Object.entries(match.captures).filter(([k]) => k.startsWith("allowed"))
+        if (leaseCaptures.length === 0) return false // unconditional match → passing
+        return !leaseSvc!.isGranted(match.group.name, match.captures)
+      })
+
+      if (failing.length === 0) return // all segments pass
+
+      // Use the full command for the dialog (not individual segments).
+      const firstMatch = permissionSvc.check(failing[0]!)
+      const decision = await requestPermission(ctx, pi, "Allow command?", cmd, firstMatch)
+
+      if (decision.tag === "once") return
+
+      if (decision.tag === "grant") {
+        const grp = firstMatch?.group
+        if (grp) leaseSvc.grant(grp, decision.scope, decision.bindings)
+        ctx.ui.notify(`Lease granted: ${grp?.name ?? "unknown"} for this session`, "info")
+        return
+      }
+
+      if (decision.tag === "customize") {
+        await openOrFocusNegotiationPane(pi, ctx, cmd, leaseSvc, permissionSvc)
+        return {
+          block: true,
+          reason: "Customize permissions in the negotiation pane, then retry.",
+        }
+      }
 
       return {
         block: true,
-        reason: ctx.hasUI
-          ? "User denied command."
-          : `Command not on allow-list (no UI to confirm): ${cmd.slice(0, 120)}`,
-      };
+        reason: ctx.hasUI ? "User denied command." : `Command blocked (no UI): ${cmd.slice(0, 120)}`,
+      }
     }
 
     // ── MCP upstream writes ──────────────────────────────────────────────────
     if (UPSTREAM_MCP_TOOLS.has(event.toolName)) {
-      const label = event.toolName
-        .replace("mcp__github_", "")
-        .replace(/_/g, " ");
-      const detail = JSON.stringify(event.input, null, 2);
+      const label = event.toolName.replace("mcp__github_", "").replace(/_/g, " ")
       const decision = await requestPermission(
-        ctx,
-        pi,
-        `Allow upstream: ${label}?`,
-        detail,
-      );
+        ctx, pi, `Allow upstream: ${label}?`,
+        JSON.stringify(event.input, null, 2),
+        null,
+      )
 
-      if (decision === "always") {
-        // For MCP tools we store "mcp:<toolName>" so it doesn't clash with bash entries
-        const key = `mcp:${event.toolName}`;
-        persistentAllowed.add(key);
-        savePersistentAllowed();
-        ctx.ui.notify(`${label} will always be allowed`, "info");
-        return;
+      if (decision.tag === "once") return
+      if (decision.tag === "grant") return // MCP tools don't use capture bindings
+      if (decision.tag === "customize") {
+        await openOrFocusNegotiationPane(
+          pi, ctx, `mcp:${event.toolName}`, leaseSvc!, permissionSvc!
+        )
       }
-
-      if (decision === "once") return;
 
       return {
         block: true,
-        reason: ctx.hasUI
-          ? "User denied upstream operation."
-          : `Upstream tool ${event.toolName} requires UI confirmation.`,
-      };
+        reason: ctx.hasUI ? "User denied upstream operation." : `Upstream tool ${event.toolName} requires UI confirmation.`,
+      }
     }
-  });
+  })
 }
