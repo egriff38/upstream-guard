@@ -143,10 +143,10 @@ async function openOrFocusNegotiationPane(
     return
   }
 
-  const paneJson = await pi.exec("herdr", [
-    "pane", "split", "$HERDR_PANE_ID", "--direction", "right", "--no-focus",
+  const paneResult = await pi.exec("herdr", [
+    "pane", "split", process.env["HERDR_PANE_ID"] ?? "", "--direction", "right", "--no-focus",
   ])
-  const parsed = JSON.parse(paneJson.stdout ?? "{}")
+  const parsed = JSON.parse(paneResult.stdout || "{}") as { result?: { pane?: { pane_id?: string } } }
   const paneId: string = parsed?.result?.pane?.pane_id ?? ""
   if (!paneId) {
     ctx.ui.notify("Could not open negotiation pane — is herdr running?", "error")
