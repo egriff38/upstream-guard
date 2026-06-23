@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent"
 import { Effect, Layer } from "effect"
-import { writeFileSync, readFileSync } from "fs"
+import { readFileSync } from "fs"
 import type { MatchResult } from "./core/types.ts"
 import { PermissionsImportError } from "./core/config.ts"
 import { PermissionService, PermissionServiceLayer, splitShellSegments } from "./core/permission.ts"
@@ -120,6 +120,37 @@ async function requestPermission(
 
 let negotiationPaneId: string | null = null
 
+function buildNegotiationPrompt(
+  blockedCmd: string,
+  leases: LeaseServiceShape,
+  permissions: PermissionServiceShape,
+  cwd: string,
+): string {
+  const bindings = leases.all()
+  const bindingSummary = bindings.length
+    ? bindings.map(g => `  • ${g.group}: ${JSON.stringify(g.bindings)}`).join("\n")
+    : "  (none)"
+  const groupNames = permissions.groups.map(g => g.name).join(", ")
+
+  return [
+    `You are a permission negotiation assistant for upstream-guard.`,
+    ``,
+    `A command was blocked: \`${blockedCmd}\``,
+    `Working directory: ${cwd}`,
+    ``,
+    `Active session bindings:\n${bindingSummary}`,
+    ``,
+    `Available permission groups: ${groupNames}`,
+    `Permissions repo: ${process.env["HOME"]}/.omp/permissions/`,
+    ``,
+    `Review the blocked command and the existing permission groups. Suggest which group`,
+    `to add a pattern to, or propose a new group with an appropriate extends chain.`,
+    `Use named capture groups (?<allowedX>...) for values that should scope the lease.`,
+    `Do NOT write any files until the user explicitly approves your proposal.`,
+    `When approved changes are written, output the exact text GRANTS_APPLIED on its own line.`,
+  ].join("\n")
+}
+
 async function openOrFocusNegotiationPane(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -127,35 +158,35 @@ async function openOrFocusNegotiationPane(
   leases: LeaseServiceShape,
   permissions: PermissionServiceShape,
 ): Promise<void> {
-  const handoff = {
-    blockedCommands: [blockedCmd],
-    cwd: ctx.cwd,
-    activeBindings: Object.fromEntries(leases.all().map(g => [g.group, g.bindings])),
-    builtinPatternCount: permissions.groups.length,
-    recentContext: [] as string[], // TODO: populate from ctx.sessionManager.getBranch()
-  }
-  const handoffPath = `/tmp/upstream-guard-handoff-${Date.now()}.json`
-  writeFileSync(handoffPath, JSON.stringify(handoff, null, 2))
+  const prompt = buildNegotiationPrompt(blockedCmd, leases, permissions, ctx.cwd)
 
   if (negotiationPaneId) {
-    // Re-use existing pane: push the new command as a follow-up prompt.
-    await pi.exec("herdr", ["pane", "run", negotiationPaneId, `New blocked command: ${blockedCmd}`])
+    // Re-use existing pane: send the new prompt directly to the running OMP instance.
+    await pi.exec("herdr", ["agent", "wait", negotiationPaneId, "--status", "idle", "--timeout", "10000"])
+      .catch(() => { /* best-effort — send anyway */ })
+    await pi.exec("herdr", ["agent", "send", negotiationPaneId, prompt])
     return
   }
 
-  const paneResult = await pi.exec("herdr", [
+  // Split a new pane to the right, don't steal focus.
+  const splitResult = await pi.exec("herdr", [
     "pane", "split", process.env["HERDR_PANE_ID"] ?? "", "--direction", "right", "--no-focus",
   ])
-  const parsed = JSON.parse(paneResult.stdout || "{}") as { result?: { pane?: { pane_id?: string } } }
-  const paneId: string = parsed?.result?.pane?.pane_id ?? ""
+  const splitParsed = JSON.parse(splitResult.stdout || "{}") as { result?: { pane?: { pane_id?: string } } }
+  const paneId = splitParsed?.result?.pane?.pane_id ?? ""
   if (!paneId) {
     ctx.ui.notify("Could not open negotiation pane — is herdr running?", "error")
     return
   }
   negotiationPaneId = paneId
 
-  await pi.exec("herdr", ["pane", "run", paneId, `omp --handoff ${handoffPath}`])
+  // Start OMP in the new pane, then wait for it to be idle before sending the prompt.
+  await pi.exec("herdr", ["pane", "run", paneId, "omp"])
+  await pi.exec("herdr", ["agent", "wait", paneId, "--status", "idle", "--timeout", "30000"])
+    .catch(() => { /* timeout — send anyway, OMP may still be loading */ })
+  await pi.exec("herdr", ["agent", "send", paneId, prompt])
 }
+
 
 // ── Runtime layer ─────────────────────────────────────────────────────────────
 
@@ -223,20 +254,27 @@ export default function upstreamGuard(pi: ExtensionAPI) {
 
   const z = pi.zod
 
+  const leaseSchema = z.object({
+    group: z.string().describe("Group name, e.g. 'git:remoteAuthor'"),
+    scope: z.enum(["task", "session"] as const).default("task"),
+    bindings: z.record(z.string(), z.string()).optional(),
+  })
+  const requestLeaseParams = z.object({
+    leases: z.array(leaseSchema).min(1),
+    reason: z.string().describe("Why this task needs these permissions"),
+  })
+
+  // TypeBox cannot resolve the generic depth of nested zod schemas at compile time;
+  // the runtime schema and execute params are correct.
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-expect-error TS2589
   pi.registerTool({
     name: "request_permission_lease",
     label: "Request Permission Lease",
     description:
       "Declare the permission groups and bindings a skill or subagent needs before starting its task. " +
       "The user is prompted once to approve, deny, or customize the full set.",
-    parameters: z.object({
-      leases: z.array(z.object({
-        group: z.string().describe("Group name, e.g. 'git:remoteAuthor'"),
-        scope: z.enum(["task", "session"]).default("task"),
-        bindings: z.record(z.string(), z.string()).default({}),
-      })).min(1),
-      reason: z.string().describe("Why this task needs these permissions"),
-    }),
+    parameters: requestLeaseParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!leaseSvc || !permissionSvc) {
         return {
@@ -246,7 +284,7 @@ export default function upstreamGuard(pi: ExtensionAPI) {
       }
 
       const display = params.leases
-        .map(l => `  • ${l.group}${Object.keys(l.bindings).length ? ` (${Object.entries(l.bindings).map(([k, v]) => `${k}=${v}`).join(", ")})` : ""}`)
+        .map(l => { const b = l.bindings ?? {}; return `  • ${l.group}${Object.keys(b).length ? ` (${Object.entries(b).map(([k, v]) => `${k}=${v}`).join(", ")})` : ""}` })
         .join("\n")
 
       pi.events.emit("herdr:blocked", { active: true, label: "Lease request…" })
@@ -265,7 +303,7 @@ export default function upstreamGuard(pi: ExtensionAPI) {
       if (choice === "Grant") {
         for (const req of params.leases) {
           const grp = permissionSvc.groups.find(g => g.name === req.group)
-          if (grp) leaseSvc.grant(grp, req.scope, req.bindings as Record<string, string>)
+          if (grp) leaseSvc.grant(grp, req.scope, req.bindings ?? {})
         }
         return {
           content: [{ type: "text", text: `Granted ${params.leases.length} lease(s).` }],
